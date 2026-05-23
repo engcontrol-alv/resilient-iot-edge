@@ -1,0 +1,12 @@
+# Hardware & Memory Configuration
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# RTOS Optimization (Dual-Core & FSM Determinism)
+CONFIG_FREERTOS_HZ=1000
+
+# System Resilience (Hardware Watchdog)
+CONFIG_ESP_TASK_WDT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Build Optimization (Size)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
