@@ -1,9 +1,11 @@
+# =============================================================================
+# Resilient IoT Edge — Main Component Configuration
+# =============================================================================
+
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
-    REQUIRES 
-        freertos 
-        esp_timer 
-        esp_driver_gpio 
-        driver
+    SRCS
+        "main.c"
+        "storage_driver.c"       # [DEV1] LittleFS Write-First driver
+    INCLUDE_DIRS
+        "."
 )

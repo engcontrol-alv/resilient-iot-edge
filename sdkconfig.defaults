@@ -1,12 +1,30 @@
-# Hardware & Memory Configuration
+# =============================================================================
+# DEV1 — Custom Partition Table
+# =============================================================================
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
+# =============================================================================
 # RTOS Optimization (Dual-Core & FSM Determinism)
+# =============================================================================
 CONFIG_FREERTOS_HZ=1000
+# Main task stack: 8KB for LittleFS + OLED I2C concurrency (DEV1+)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# =============================================================================
 # System Resilience (Hardware Watchdog)
-CONFIG_ESP_TASK_WDT=y
+# =============================================================================
+CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 
-# Build Optimization (Size)
-CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# =============================================================================
+# Build & Debug Configuration
+# =============================================================================
+CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y
+
+# =============================================================================
+# Component Configuration
+# =============================================================================
+# Suppress legacy I2C deprecation warning — migration tracked in DEV roadmap
+CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y

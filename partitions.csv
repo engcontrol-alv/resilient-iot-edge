@@ -1,0 +1,10 @@
+# =============================================================================
+# Resilient IoT Edge — ESP32-S3FN8 (8 MB Flash)
+# NOTE: OTA support intentionally out of scope for v1.0.
+#       Future migration path: split 'factory' into ota_0 + ota_1 + otadata.
+# =============================================================================
+# Name,     Type, SubType, Offset, Size, Flags
+nvs,        data, nvs,     ,       0x4000,
+phy_init,   data, phy,     ,       0x1000,
+factory,    app,  factory, ,       2M,
+lfs,        data, spiffs,  ,       2M,

@@ -1,10 +1,13 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "storage_driver.h"      // [DEV1] Write-First storage layer
 
 // --- HELTEC V3 OFFICIAL PINOUT ---
 #define OLED_SDA 17
@@ -51,7 +54,7 @@ static const uint8_t font5x7[59][5] = {
 };
 
 // --- HELTEC POWER MANAGEMENT ---
-void oled_power_setup() {
+void oled_power_setup(void) {
     gpio_reset_pin(OLED_VEXT);
     gpio_set_direction(OLED_VEXT, GPIO_MODE_OUTPUT);
     gpio_set_level(OLED_VEXT, 0); 
@@ -66,7 +69,7 @@ void oled_power_setup() {
 }
 
 // --- I2C COMMUNICATION ---
-void i2c_master_init() {
+void i2c_master_init(void) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = OLED_SDA, .scl_io_num = OLED_SCL,
@@ -88,7 +91,7 @@ void oled_send_cmd(uint8_t cmd) {
     i2c_cmd_link_delete(cmd_handle);
 }
 
-void oled_send_data(uint8_t *data, size_t len) {
+void oled_send_data(const uint8_t *data, size_t len) {
     i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
     i2c_master_start(cmd_handle);
     i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -99,16 +102,16 @@ void oled_send_data(uint8_t *data, size_t len) {
     i2c_cmd_link_delete(cmd_handle);
 }
 
-void oled_software_setup() {
+void oled_software_setup(void) {
     uint8_t init_cmds[] = {
         0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40, 0x81, 0xFF,
         0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3, 0x00, 0xD5, 0x80, 0xD9,
         0xF1, 0xDA, 0x12, 0xDB, 0x40, 0x8D, 0x14, 0xAF
     };
-    for(int i=0; i<sizeof(init_cmds); i++) oled_send_cmd(init_cmds[i]);
+    for(size_t i = 0; i < sizeof(init_cmds); i++) oled_send_cmd(init_cmds[i]);
 }
 
-void oled_clear() {
+void oled_clear(void) {
     uint8_t zero[128];
     memset(zero, 0, 128);
     for (int i = 0; i < 8; i++) {
@@ -123,7 +126,7 @@ void oled_draw_char(uint8_t x, uint8_t page, char c) {
     oled_send_cmd(0xB0 + page);
     oled_send_cmd(0x00 + (x & 0x0F));
     oled_send_cmd(0x10 + ((x >> 4) & 0x0F));
-    oled_send_data((uint8_t*)font5x7[idx], 5);
+    oled_send_data((const uint8_t*)font5x7[idx], 5);
     uint8_t space = 0x00;
     oled_send_data(&space, 1);
 }
@@ -157,11 +160,34 @@ void app_main(void)
     oled_software_setup();   
     oled_clear();            
 
-    // Permanent Header String on Page 0 (Written once to avoid I2C overhead)
-    // Using spaces instead of hyphens to bypass custom 5x7 font limitations.
     oled_print(0, 0, "RESILIENT IOT EDGE"); 
 
-    int last_state = -1; // Stores the previous state to prevent redundant I2C writes
+    // --- NEW PHASE 3: LITTLEFS INITIALIZATION (FAIL-FAST) ---
+    ESP_LOGI(TAG, "Initializing LittleFS Storage...");
+    if (storage_init() != ESP_OK) {
+        ESP_LOGE(TAG, "FS MOUNT ERROR! Rebooting...");
+        oled_print(0, 7, "FS MOUNT ERROR!     ");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart(); // [DEV1] Fail-fast: restarts the board if memory mount fails
+    }
+    
+    // Read saved data
+    uint32_t pending_records = storage_get_pending_count();
+    ESP_LOGI(TAG, "[RECOVERY] %lu record(s) pending from previous session", (unsigned long)pending_records);
+
+    // Visual effect on OLED: If data was recovered, flash the RECOVERY message
+    if (pending_records > 0) {
+        oled_print(0, 3, "RECOVERY ACTIVE   ");
+        vTaskDelay(pdMS_TO_TICKS(1500)); // Wait 1.5s for the user to read the message
+    }
+
+    // Print the initial state IMMEDIATELY (fixes the "blank line" UX bug)
+    char init_info[21];
+    snprintf(init_info, sizeof(init_info), "STORE: %05lu PEND  ", (unsigned long)pending_records);
+    oled_print(0, 3, init_info);
+
+    uint32_t s_tick = 0U;  // [DEV1] FSM tick counter for periodic storage writes
+    int last_state = -1;   // Stores the previous state to prevent redundant I2C writes
 
     while (1) {
         // Core system logic routes based on FSM state
@@ -171,29 +197,46 @@ void app_main(void)
                 oled_print(0, 2, "FSM: CONFIG MODE    ");
                 break;
 
-            case SYS_MODE_OPERATION:
+            case SYS_MODE_OPERATION: {
                 oled_print(0, 2, "FSM: OPERATION      ");
                 
-                // Sample the current electrical level of the sensor pin
-                int current_state = gpio_get_level(TEST_GPIO_A);
-
-                // Execute logic only upon state transition
-                if (current_state != last_state) {
-                    last_state = current_state;
-
-                    if (current_state == 1) {
+                /* ── GPIO Sampling (anti-flicker guard) ────────────────────────── */
+                int gpio_level = gpio_get_level(TEST_GPIO_A);
+                if (gpio_level != last_state) {
+                    last_state = gpio_level;
+                    if (gpio_level == 1) {
                         gpio_set_level(TEST_GPIO_B, 1);
                         oled_print(0, 4, "GPIO 4 = HIGH (SIGN)");
-                        oled_print(0, 6, "GPIO 2 = HIGH (ON)  "); 
-                        ESP_LOGI(TAG, "[OPERATION] Signal detected! GPIO 4: HIGH -> GPIO 2: HIGH");
+                        oled_print(0, 6, "GPIO 2 = HIGH (ON)  ");
+                        ESP_LOGI(TAG, "[OPERATION] GPIO 4: HIGH -> GPIO 2: HIGH");
                     } else {
                         gpio_set_level(TEST_GPIO_B, 0);
                         oled_print(0, 4, "GPIO 4 = LOW (WAIT) ");
-                        oled_print(0, 6, "GPIO 2 = LOW (OFF)  "); 
-                        ESP_LOGI(TAG, "[OPERATION] Signal lost. GPIO 4: LOW -> GPIO 2: LOW");
+                        oled_print(0, 6, "GPIO 2 = LOW (OFF)  ");
+                        ESP_LOGI(TAG, "[OPERATION] GPIO 4: LOW -> GPIO 2: LOW");
+                    }
+                }
+
+                /* ── [DEV1] Periodic Storage Write (every 5 s = 100 × 50 ms) ──── */
+                if ((s_tick % 100U) == 0U && s_tick > 0U) {
+                    char record[STORAGE_MAX_LINE_LEN];
+                    snprintf(record, sizeof(record),
+                             "{\"uptime_ms\":%lu,\"gpio\":%d,\"state\":\"OPERATION\",\"seq\":%lu}",
+                             (unsigned long)(s_tick * 50UL),
+                             gpio_level,
+                             (unsigned long)(s_tick / 100UL));
+
+                    if (storage_append(record) == ESP_OK) {
+                        char info[21];
+                        snprintf(info, sizeof(info), "STORE: %05lu PEND  ",
+                                 (unsigned long)storage_get_pending_count());
+                        oled_print(0, 3, info);
+                        ESP_LOGI(TAG, "[DEV1] Record stored. Pending: %lu",
+                                 (unsigned long)storage_get_pending_count());
                     }
                 }
                 break;
+            }
 
             case SYS_MODE_EMERGENCY:
                 oled_print(0, 2, "FSM: EMERGENCY      ");
@@ -202,8 +245,14 @@ void app_main(void)
             case SYS_MODE_RESYNC:
                 oled_print(0, 2, "FSM: RESYNC         ");
                 break;
+                
+            default:
+                ESP_LOGE(TAG, "FSM: INVALID STATE %d — forcing EMERGENCY", current_mode);
+                current_mode = SYS_MODE_EMERGENCY;
+                break;
         }
 
+        s_tick++; // [DEV1] Advance FSM tick counter
         // Deterministic sampling interval (50ms)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
