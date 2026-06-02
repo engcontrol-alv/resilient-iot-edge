@@ -1,64 +1,197 @@
 # Resilient IoT Edge
 
-> **Reference firmware for resilient IoT systems with local persistence in LittleFS and asynchronous synchronization via MQTT.**
-> Designed to operate on dual-core hardware (ESP32-S3), aiming to mitigate data loss during severe connectivity failures.
+> **Reference firmware for resilient IoT edge nodes with local telemetry persistence
+> and asynchronous cloud synchronization via MQTT.**
+> Designed for dual-core hardware (ESP32-S3), engineered to guarantee zero data loss
+> during severe and prolonged connectivity failures in remote installations.
 
 ![Status](https://img.shields.io/badge/Status-Active%20Development-success)
 ![Hardware](https://img.shields.io/badge/Hardware-ESP32--S3-orange)
+![Framework](https://img.shields.io/badge/Framework-ESP--IDF%206.x-blue)
 ![RTOS](https://img.shields.io/badge/OS-FreeRTOS-green)
-![CI/CD](https://img.shields.io/badge/Build-Passing-brightgreen)
+![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+
+---
 
 ## Overview
-This project implements an Industrial Edge Computing architecture focused on uninterrupted telemetry using a Finite State Machine (FSM) optimized for asymmetric dual-core execution:
 
-* **Core 0 (Data Plane):** Dedicated to high-priority, deterministic tasks: real-time signal acquisition (GPIO telemetry) and local persistence writing.
+This project implements an Industrial Edge Computing architecture focused on
+uninterrupted telemetry acquisition. The core design principle is the
+**Write-First policy**: every sensor reading is committed to non-volatile
+storage *before* any network transmission attempt. If connectivity fails,
+no data is lost — it is queued locally and synchronized automatically when
+the connection is restored.
 
-* **Core 1 (Control & Network Plane):** Dedicated to asynchronous, heavy network operations: Wi-Fi stack management, Captive Portal hosting, and MQTT synchronization.
+The firmware is structured around a **Finite State Machine (FSM)** running on
+a strict **Asymmetric Multiprocessing (AMP)** model:
 
-## Operational Modes (System FSM)
-The firmware monitors connectivity events and storage metrics to transition seamlessly between 4 operational states:
+| Core | Plane | Responsibilities |
+|------|-------|-----------------|
+| Core 0 (PRO_CPU) | Data Plane | GPIO sampling, OLED display, LittleFS writes |
+| Core 1 (APP_CPU) | Network Plane | Wi-Fi stack, Captive Portal, MQTT, Store-and-Forward |
 
-* 1. **Configuration Mode (SYS_MODE_CONFIG):** Active upon first boot or connection failure timeout. Core 1 initiates an Access Point (AP) and hosts a Captive Portal for network provisioning.
+---
 
-* 2. **Operation Mode (SYS_MODE_OPERATION):** The standard "online" state. Core 0 samples inputs in real-time, while Core 1 streams packets immediately to the cloud via MQTT 5.0.
+## Operational States (FSM)
 
-* 3. **Emergency / Offline Mode (SYS_MODE_EMERGENCY):** Triggered autonomously upon detecting network/broker blackout. Core 0 intercepts the data stream and spools telemetry into a non-volatile circular buffer inside LittleFS, avoiding data loss.
+The firmware transitions seamlessly between four states based on connectivity
+and storage events:
 
-* 4. **Resynchronization Mode (SYS_MODE_RESYNC):** Triggered as soon as connection is re-established. Core 1 runs a background Store-and-Forward algorithm to drain historical logs from LittleFS, while Core 0 continues acquiring real-time data with zero jitter.
+### `SYS_MODE_CONFIG` — First Boot / Provisioning
+Active when no Wi-Fi credentials exist in NVS. Core 1 starts a SoftAP
+(`resilient-iot-cfg`) and serves an HTTP Captive Portal at `192.168.4.1`.
+The field technician connects, submits SSID + password, and the device
+switches to STA mode and transitions to OPERATION automatically.
 
-## Technology Stack & Hardware
-* **Microcontroller:** Heltec WiFi LoRa 32 V3 (ESP32-S3FN8 Dual-Core Xtensa LX7)
-* **Framework:** C / ESP-IDF (Espressif IoT Development Framework) running on FreeRTOS
-* **Protocols:** Wi-Fi 802.11 b/g/n, Captive Portal (DNS Redirect + HTTP), MQTT 5.0 (QoS 1)
-* **Storage:** LittleFS for embedded Flash with Wear Leveling
+### `SYS_MODE_OPERATION` — Normal Online State
+Core 0 samples inputs deterministically at 50ms intervals. Core 1 streams
+telemetry to the cloud via MQTT (QoS 1). Write-First policy is active:
+every record is written to LittleFS before publishing.
 
-### Hardware Notes (Heltec V3)
-The following pinout configurations were used for this board:
-* **OLED Display Pinout:** `SDA: 17`, `SCL: 18`, `RST: 21`, `Vext (Power): 36` (Active LOW).
-* **Serial Monitor (USB CDC):** Configured natively via ESP-IDF menuconfig (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`) to prevent boot crashes.
+### `SYS_MODE_EMERGENCY` — Network Blackout
+Triggered on Wi-Fi disconnect. Core 0 continues sampling and appends every
+record to the LittleFS FIFO queue with no data loss. Core 1 runs an
+exponential backoff reconnection loop (1s → 2s → 4s → ... → 60s cap).
+
+### `SYS_MODE_RESYNC` — Synchronization Recovery
+Triggered on reconnection. Core 1 drains the LittleFS backlog via
+Store-and-Forward, publishing each historical record via MQTT QoS 1 and
+advancing the sync cursor only after receiving PUBACK. Core 0 continues
+real-time acquisition with zero jitter throughout.
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Microcontroller | Heltec WiFi LoRa 32 V3 (ESP32-S3FN8, Dual-Core Xtensa LX7 @ 240MHz) |
+| Framework | C / ESP-IDF 6.x (native, no Arduino abstraction) |
+| RTOS | FreeRTOS — 1000Hz tick, 8KB main task stack |
+| Storage | LittleFS (`joltwallet/littlefs` v1.21.1) — power-loss safe CoW journaling |
+| Connectivity | Wi-Fi 802.11 b/g/n + MQTT (QoS 1) |
+| Provisioning | Captive Portal — SoftAP + HTTP server + NVS credential storage |
+| Display | SSD1306 OLED — bare-metal I2C driver (no external library) |
+
+---
+
+## Hardware Notes (Heltec WiFi LoRa 32 V3)
+
+### Pinout
+
+| Function | GPIO | Notes |
+|----------|------|-------|
+| OLED SDA | 17 | I2C data |
+| OLED SCL | 18 | I2C clock |
+| OLED RST | 21 | Active-low reset |
+| OLED VEXT | 36 | Active-low power enable |
+| Sensor Input | 4 | Pull-down; ADC1 channel |
+| Control Output | 2 | Mirrors sensor input state |
+
+### ADC Constraint
+
+The ESP32-S3 has a documented silicon conflict: **ADC2 is incompatible with
+the Wi-Fi RF front-end**. All analog acquisition uses **ADC1 exclusively**.
+This constraint is enforced at the pin mapping level and documented in
+`docs/architecture/system_design.md`.
+
+### Serial Console
+
+This firmware uses **UART0** (GPIO 43/44) as the serial console — the default
+ESP-IDF configuration for the Heltec V3 board. Do not set
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` on this hardware; the board uses a
+USB-UART bridge chip and the native USB peripheral is not connected to the
+USB port.
+
+---
 
 ## Repository Structure
+
 ```text
-resilient-edge-iot/
-├── .github/workflows/     # CI/CD: ESP-IDF Docker build automation
+resilient-iot-edge/
 ├── docs/
-│   ├── architecture/      # State diagrams and multithreading design
-│   └── tests/             # QA: Test Cases and Validation Plan (IEEE 829)
-├── main/                  # Main FSM logic, RTOS tasks, and internal components
-├── scripts/               # Auxiliary tools for log collection and simulation
-├── CMakeLists.txt         # Root CMake configuration
-└── sdkconfig.defaults     # Core hardware and RTOS optimizations
+│   ├── architecture/
+│   │   └── system_design.md      # AMP, FSM, Write-First, hardware constraints
+│   └── tests/
+│       └── validation_plan.md    # SVVP — TC-01 to TC-23 (IEEE Std 830-1998)
+├── main/
+│   ├── main.c                    # FSM loop, OLED driver, hardware init
+│   ├── storage_driver.c          # LittleFS Write-First FIFO queue
+│   ├── storage_driver.h          # Storage API and constants
+│   ├── CMakeLists.txt            # Component build config
+│   └── idf_component.yml         # IDF Component Manager manifest
+├── partitions.csv                # Flash layout: 2MB factory + 2MB LittleFS
+├── sdkconfig.defaults            # RTOS, flash, stack, watchdog config
+├── dependencies.lock             # Pinned component versions
+└── CMakeLists.txt                # Root project config
 ```
 
+---
+
 ## Development Status
-- [x] Phase 1 (Setup & Planning): Repository structuring, architecture definition, and test plan creation.
 
-- [x] Phase 2 (Hardware & RTOS Base): Pinout validation (Heltec V3), USB Serial stabilization, and Multi-Core skeleton implementation (FreeRTOS).
+- [x] **Phase 1 — Setup & Planning:** Repository structure, architecture definition,
+      SVVP test plan, IEEE 830-1998 documentation baseline.
+- [x] **Phase 2 — Hardware & RTOS Base:** Heltec V3 pinout validation, OLED bare-metal
+      driver, FSM skeleton at 50ms deterministic tick.
+- [x] **Phase 3 — Local Storage:** LittleFS driver, Write-First policy, FIFO queue,
+      power-loss recovery validated (TC-05, TC-07, TC-08 partial).
+- [ ] **Phase 4 — Connectivity:** Wi-Fi STA/AP, Captive Portal provisioning,
+      MQTT client with QoS 1 and Will message.
+- [ ] **Phase 5 — Synchronization:** FSM complete 4-state transitions,
+      Store-and-Forward drain with PUBACK confirmation.
+- [ ] **Phase 6 — Final Validation:** BDD fault-injection tests, 72h stability
+      run, TC completion (TC-09 to TC-23).
 
-- [ ] Phase 3 (Local Storage): LittleFS configuration and circular buffer implementation (Core 0).
+---
 
-- [ ] Phase 4 (Connectivity): Wi-Fi/MQTT integration and network failure detection routine (Core 1).
+## Getting Started
 
-- [ ] Phase 5 (Synchronization): Store-and-Forward logic development for sending backlogged data post-failure.
+### Prerequisites
 
-- [ ] Phase 6 (Final Validation): Practical tests simulating network blackouts and integration with orchestrator (Node-RED).
+- [ESP-IDF 6.x](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/)
+- Python 3.x (included with ESP-IDF installer)
+- Heltec WiFi LoRa 32 V3 board
+- USB cable connected to the board's USB port
+
+### Build and Flash
+
+```bash
+# First build — downloads joltwallet/littlefs automatically
+idf.py build
+
+# Flash and monitor (adjust port as needed)
+idf.py -p COM7 flash monitor
+```
+
+### First Boot
+
+On first boot with an empty NVS, the device enters CONFIG state and creates
+a Wi-Fi access point named `resilient-iot-cfg`. Connect a phone or laptop
+to that network and navigate to `192.168.4.1` to provision Wi-Fi credentials.
+
+### Expected Serial Output (after provisioning)
+
+```
+I (xxx) SYSTEM_MAIN: Configuring basic hardware interface...
+I (xxx) SYSTEM_MAIN: Initializing OLED display...
+I (xxx) SYSTEM_MAIN: Initializing LittleFS Storage...
+I (xxx) STORAGE: LittleFS: 2048 KB total | 4 KB used | 2044 KB free
+I (xxx) SYSTEM_MAIN: Storage ready. Pending records: 0
+I (xxx) SYSTEM_MAIN: [DEV1] Record stored. Pending: 1
+```
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [`docs/architecture/system_design.md`](docs/architecture/system_design.md) | Full architecture: AMP, FSM states, Write-First policy, thread safety, hardware constraints |
+| [`docs/tests/validation_plan.md`](docs/tests/validation_plan.md) | SVVP: 23 test cases mapped to implementation phases (IEEE Std 830-1998) |
+
+---
+
+## License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
