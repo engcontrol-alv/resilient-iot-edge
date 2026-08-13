@@ -21,7 +21,7 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 # =============================================================================
 # Build & Debug Configuration
 # =============================================================================
-CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y
+CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
 
 # =============================================================================
 # Component Configuration

@@ -1,0 +1,12 @@
+menu "Resilient IoT Edge"
+
+    config RIE_EMERGENCY_MIN_BUFFER_HOURS
+        int "Guaranteed minimum buffer duration in EMERGENCY (hours)"
+        default 8
+        range 1 168
+        help
+            The firmware calculates the required write interval to
+            guarantee this minimum duration before the local buffer (LittleFS)
+            starts dropping data, based on the partition size.
+
+endmenu

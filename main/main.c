@@ -4,152 +4,59 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "storage_driver.h"      // [DEV1] Write-First storage layer
+#include "esp_timer.h"
 
-// --- HELTEC V3 OFFICIAL PINOUT ---
-#define OLED_SDA 17
-#define OLED_SCL 18
-#define OLED_RST 21
-#define OLED_VEXT 36
+#include "storage_driver.h"      // [DEV1] Write-First storage layer
+#include "wifi_manager.h"        // [DEV2] Wi-Fi AP/STA management
+#include "captive_portal.h"      // [DEV2] HTTP + DNS provisioning portal
+#include "oled_driver.h"         // [REFACTORED] OLED Display Driver
 
 // --- I/O MAPPING ---
 #define TEST_GPIO_A 4        // INPUT (Controller Signal)
 #define TEST_GPIO_B 2        // DIRECT OUTPUT (Follows GPIO 4)
 
-#define I2C_PORT I2C_NUM_0
-#define OLED_ADDR 0x3C
+// Conservative estimate of bytes/record (current NDJSON format).
+// Better to underestimate capacity than overestimate promised duration.
+#define ESTIMATED_RECORD_BYTES     70U
+#define TARGET_BUFFER_SECONDS      (CONFIG_RIE_EMERGENCY_MIN_BUFFER_HOURS * 3600U)
+#define MAX_RECORDS_IN_BUFFER      (STORAGE_MAX_FILE_SIZE / ESTIMATED_RECORD_BYTES)
+
+// Ceiling division — guarantees duration >= configured limit,
+// never less (truncating down would make the interval too short 
+// and actual duration would fall below the promised one).
+#define EMERGENCY_WRITE_INTERVAL_TICKS \
+    (((TARGET_BUFFER_SECONDS * 1000U) + (MAX_RECORDS_IN_BUFFER * 50U) - 1U) \
+     / (MAX_RECORDS_IN_BUFFER * 50U))
+
 static const char *TAG = "SYSTEM_MAIN";
 
 // --- FINITE STATE MACHINE (FSM) ---
 typedef enum {
     SYS_MODE_CONFIG,
+    SYS_MODE_CONNECTING,     // [NEW] Non-blocking connection state
     SYS_MODE_OPERATION,
     SYS_MODE_EMERGENCY,
     SYS_MODE_RESYNC
 } system_mode_t;
 
-// MVP initializes in OPERATION mode
-volatile system_mode_t current_mode = SYS_MODE_OPERATION;
+volatile system_mode_t current_mode = SYS_MODE_CONFIG;
+static uint64_t connection_start_time = 0; // For Wi-Fi connection timeout
 
-// --- 5x7 MINI FONT ---
-static const uint8_t font5x7[59][5] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x2f, 0x00, 0x00}, {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7f, 0x14, 0x7f, 0x14},
-    {0x24, 0x2a, 0x7f, 0x2a, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62}, {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00},
-    {0x00, 0x1c, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1c, 0x00}, {0x14, 0x08, 0x3E, 0x08, 0x14}, {0x08, 0x08, 0x3E, 0x08, 0x08},
-    {0x00, 0x00, 0x50, 0x30, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08}, {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02},
-    {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
-    {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39}, {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
-    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E}, {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00},
-    {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14}, {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06},
-    {0x32, 0x49, 0x59, 0x51, 0x3E}, {0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36}, {0x3E, 0x41, 0x41, 0x41, 0x22},
-    {0x7F, 0x41, 0x41, 0x22, 0x1C}, {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01}, {0x3E, 0x41, 0x49, 0x49, 0x7A},
-    {0x7F, 0x08, 0x08, 0x08, 0x7F}, {0x00, 0x41, 0x7F, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3F, 0x01}, {0x7F, 0x08, 0x14, 0x22, 0x41},
-    {0x7F, 0x40, 0x40, 0x40, 0x40}, {0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F}, {0x3E, 0x41, 0x41, 0x41, 0x3E},
-    {0x7F, 0x09, 0x09, 0x09, 0x06}, {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31},
-    {0x01, 0x01, 0x7F, 0x01, 0x01}, {0x3F, 0x40, 0x40, 0x40, 0x3F}, {0x1F, 0x20, 0x40, 0x20, 0x1F}, {0x3F, 0x40, 0x38, 0x40, 0x3F},
-    {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43}
-};
-
-// --- HELTEC POWER MANAGEMENT ---
-void oled_power_setup(void) {
-    gpio_reset_pin(OLED_VEXT);
-    gpio_set_direction(OLED_VEXT, GPIO_MODE_OUTPUT);
-    gpio_set_level(OLED_VEXT, 0); 
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-
-    gpio_reset_pin(OLED_RST);
-    gpio_set_direction(OLED_RST, GPIO_MODE_OUTPUT);
-    gpio_set_level(OLED_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(OLED_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-}
-
-// --- I2C COMMUNICATION ---
-void i2c_master_init(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = OLED_SDA, .scl_io_num = OLED_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE, .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
-    };
-    i2c_param_config(I2C_PORT, &conf);
-    i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
-}
-
-void oled_send_cmd(uint8_t cmd) {
-    i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
-    i2c_master_start(cmd_handle);
-    i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd_handle, 0x00, true);
-    i2c_master_write_byte(cmd_handle, cmd, true);
-    i2c_master_stop(cmd_handle);
-    i2c_master_cmd_begin(I2C_PORT, cmd_handle, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd_handle);
-}
-
-void oled_send_data(const uint8_t *data, size_t len) {
-    i2c_cmd_handle_t cmd_handle = i2c_cmd_link_create();
-    i2c_master_start(cmd_handle);
-    i2c_master_write_byte(cmd_handle, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd_handle, 0x40, true);
-    i2c_master_write(cmd_handle, data, len, true);
-    i2c_master_stop(cmd_handle);
-    i2c_master_cmd_begin(I2C_PORT, cmd_handle, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd_handle);
-}
-
-void oled_software_setup(void) {
-    uint8_t init_cmds[] = {
-        0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40, 0x81, 0xFF,
-        0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3, 0x00, 0xD5, 0x80, 0xD9,
-        0xF1, 0xDA, 0x12, 0xDB, 0x40, 0x8D, 0x14, 0xAF
-    };
-    for(size_t i = 0; i < sizeof(init_cmds); i++) oled_send_cmd(init_cmds[i]);
-}
-
-void oled_clear(void) {
-    uint8_t zero[128];
-    memset(zero, 0, 128);
-    for (int i = 0; i < 8; i++) {
-        oled_send_cmd(0xB0 + i); oled_send_cmd(0x00); oled_send_cmd(0x10);
-        oled_send_data(zero, 128);
-    }
-}
-
-void oled_draw_char(uint8_t x, uint8_t page, char c) {
-    if (c < 32 || c > 90) c = 32;
-    uint8_t idx = c - 32;
-    oled_send_cmd(0xB0 + page);
-    oled_send_cmd(0x00 + (x & 0x0F));
-    oled_send_cmd(0x10 + ((x >> 4) & 0x0F));
-    oled_send_data((const uint8_t*)font5x7[idx], 5);
-    uint8_t space = 0x00;
-    oled_send_data(&space, 1);
-}
-
-void oled_print(uint8_t x, uint8_t page, const char *str) {
-    while (*str) {
-        oled_draw_char(x, page, *str);
-        x += 6;
-        str++;
-    }
-}
+// [DEV2] EMERGENCY state — exponential backoff state
+static uint32_t s_backoff_ms      = 1000U;
+static uint32_t s_backoff_elapsed = 0U;
 
 // --- MAIN ENTRY POINT ---
 void app_main(void)
 {
     ESP_LOGI(TAG, "Configuring basic hardware interface...");
 
-    // Configure GPIO 4 as INPUT with internal pull-down
     gpio_reset_pin(TEST_GPIO_A);
     gpio_set_direction(TEST_GPIO_A, GPIO_MODE_INPUT);
     gpio_set_pull_mode(TEST_GPIO_A, GPIO_PULLDOWN_ONLY);
 
-    // Configure GPIO 2 as OUTPUT (Initially OFF)
     gpio_reset_pin(TEST_GPIO_B);
     gpio_set_direction(TEST_GPIO_B, GPIO_MODE_OUTPUT);
     gpio_set_level(TEST_GPIO_B, 0);
@@ -162,45 +69,121 @@ void app_main(void)
 
     oled_print(0, 0, "RESILIENT IOT EDGE"); 
 
-    // --- NEW PHASE 3: LITTLEFS INITIALIZATION (FAIL-FAST) ---
     ESP_LOGI(TAG, "Initializing LittleFS Storage...");
     if (storage_init() != ESP_OK) {
         ESP_LOGE(TAG, "FS MOUNT ERROR! Rebooting...");
         oled_print(0, 7, "FS MOUNT ERROR!     ");
         vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart(); // [DEV1] Fail-fast: restarts the board if memory mount fails
+        esp_restart(); // Fail-fast: restarts the board if memory mount fails
     }
     
-    // Read saved data
+    ESP_LOGI(TAG, "Initializing Wi-Fi manager...");
+    ESP_ERROR_CHECK(wifi_manager_init());
+
+    if (wifi_manager_has_credentials()) {
+        char ssid[WIFI_SSID_MAX_LEN] = {0};
+        char pass[WIFI_PASS_MAX_LEN] = {0};
+        wifi_manager_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass));
+        ESP_LOGI(TAG, "NVS credentials found — connecting to '%s'", ssid);
+        
+        wifi_manager_start_sta(ssid, pass);
+        
+        // Instead of blocking the code while waiting, change state
+        current_mode = SYS_MODE_CONNECTING;
+        connection_start_time = esp_timer_get_time();
+    } else {
+        ESP_LOGI(TAG, "No credentials found — starting Captive Portal");
+        wifi_manager_start_ap();
+        captive_portal_start();
+        current_mode = SYS_MODE_CONFIG;
+    }
+
     uint32_t pending_records = storage_get_pending_count();
     ESP_LOGI(TAG, "[RECOVERY] %lu record(s) pending from previous session", (unsigned long)pending_records);
 
-    // Visual effect on OLED: If data was recovered, flash the RECOVERY message
     if (pending_records > 0) {
-        oled_print(0, 3, "RECOVERY ACTIVE   ");
-        vTaskDelay(pdMS_TO_TICKS(1500)); // Wait 1.5s for the user to read the message
+        oled_print(0, 3, "RECOVERY ACTIVE     ");
+        vTaskDelay(pdMS_TO_TICKS(1500)); 
     }
 
-    // Print the initial state IMMEDIATELY (fixes the "blank line" UX bug)
     char init_info[21];
     snprintf(init_info, sizeof(init_info), "STORE: %05lu PEND  ", (unsigned long)pending_records);
     oled_print(0, 3, init_info);
 
-    uint32_t s_tick = 0U;  // [DEV1] FSM tick counter for periodic storage writes
-    int last_state = -1;   // Stores the previous state to prevent redundant I2C writes
+    uint32_t s_tick = 0U;
+    int last_state = -1;
+
+    // Configuration for vTaskDelayUntil (Absolute Timing)
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(50);
 
     while (1) {
-        // Core system logic routes based on FSM state
         switch (current_mode) {
-            
-            case SYS_MODE_CONFIG:
+
+            case SYS_MODE_CONFIG: {
                 oled_print(0, 2, "FSM: CONFIG MODE    ");
+                oled_print(0, 4, "SSID:RES-IOT-CFG    ");
+                oled_print(0, 5, "IP: 192.168.4.1     ");
+
+                EventBits_t bits = xEventGroupGetBits(g_wifi_event_group);
+                if (bits & WIFI_EVT_CREDENTIALS_SET) {
+                    xEventGroupClearBits(g_wifi_event_group, WIFI_EVT_CREDENTIALS_SET);
+                    captive_portal_stop();
+
+                    char ssid[WIFI_SSID_MAX_LEN] = {0};
+                    char pass[WIFI_PASS_MAX_LEN] = {0};
+                    wifi_manager_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass));
+                    
+                    xEventGroupClearBits(g_wifi_event_group, WIFI_EVT_CONNECTED | WIFI_EVT_DISCONNECTED);
+                    wifi_manager_start_sta(ssid, pass);
+                    
+                    oled_print(0, 4, "CONNECTING...       ");
+                    oled_print(0, 5, "                    ");
+
+                    connection_start_time = esp_timer_get_time();
+                    current_mode = SYS_MODE_CONNECTING;
+                }
                 break;
+            }
+
+            case SYS_MODE_CONNECTING: {
+                oled_print(0, 2, "FSM: CONNECTING     ");
+                
+                EventBits_t bits = xEventGroupGetBits(g_wifi_event_group);
+                
+                if (bits & WIFI_EVT_CONNECTED) {
+                    current_mode = SYS_MODE_OPERATION;
+                    oled_print(0, 2, "FSM: OPERATION      ");
+                    oled_print(0, 4, "                    ");
+                    ESP_LOGI(TAG, "Wi-Fi connected — entering OPERATION");
+                } 
+                // 15-second timeout (15,000,000 microseconds)
+                else if ((bits & WIFI_EVT_DISCONNECTED) || 
+                         ((esp_timer_get_time() - connection_start_time) > 15000000ULL)) {
+                    
+                    ESP_LOGW(TAG, "Wi-Fi connect failed/timeout — back to CONFIG");
+                    oled_print(0, 4, "WIFI FAILED         ");
+                    wifi_manager_start_ap();
+                    captive_portal_start();
+                    current_mode = SYS_MODE_CONFIG;
+                }
+                break;
+            }
 
             case SYS_MODE_OPERATION: {
                 oled_print(0, 2, "FSM: OPERATION      ");
-                
-                /* ── GPIO Sampling (anti-flicker guard) ────────────────────────── */
+
+                EventBits_t bits = xEventGroupGetBits(g_wifi_event_group);
+                if (bits & WIFI_EVT_DISCONNECTED) {
+                    xEventGroupClearBits(g_wifi_event_group, WIFI_EVT_DISCONNECTED);
+                    s_backoff_ms      = 1000U;
+                    s_backoff_elapsed = 0U;
+                    oled_print(0, 4, "                    ");
+                    oled_print(0, 6, "                    ");
+                    current_mode = SYS_MODE_EMERGENCY;
+                    break;
+                }
+
                 int gpio_level = gpio_get_level(TEST_GPIO_A);
                 if (gpio_level != last_state) {
                     last_state = gpio_level;
@@ -217,43 +200,93 @@ void app_main(void)
                     }
                 }
 
-                /* ── [DEV1] Periodic Storage Write (every 5 s = 100 × 50 ms) ──── */
                 if ((s_tick % 100U) == 0U && s_tick > 0U) {
                     char record[STORAGE_MAX_LINE_LEN];
                     snprintf(record, sizeof(record),
-                             "{\"uptime_ms\":%lu,\"gpio\":%d,\"state\":\"OPERATION\",\"seq\":%lu}",
-                             (unsigned long)(s_tick * 50UL),
+                             "{\"uptime_ms\":%llu,\"gpio\":%d,"
+                             "\"state\":\"OPERATION\",\"seq\":%lu}",
+                             (unsigned long long)(esp_timer_get_time() / 1000ULL),
                              gpio_level,
                              (unsigned long)(s_tick / 100UL));
-
                     if (storage_append(record) == ESP_OK) {
                         char info[21];
                         snprintf(info, sizeof(info), "STORE: %05lu PEND  ",
                                  (unsigned long)storage_get_pending_count());
                         oled_print(0, 3, info);
-                        ESP_LOGI(TAG, "[DEV1] Record stored. Pending: %lu",
-                                 (unsigned long)storage_get_pending_count());
                     }
                 }
                 break;
             }
 
-            case SYS_MODE_EMERGENCY:
+            case SYS_MODE_EMERGENCY: {
                 oled_print(0, 2, "FSM: EMERGENCY      ");
+
+                int gpio_level = gpio_get_level(TEST_GPIO_A);
+                gpio_set_level(TEST_GPIO_B, 0); 
+
+                if ((s_tick % EMERGENCY_WRITE_INTERVAL_TICKS) == 0U) {
+                    char record[STORAGE_MAX_LINE_LEN];
+                    snprintf(record, sizeof(record),
+                             "{\"uptime_ms\":%llu,\"gpio\":%d,"
+                             "\"state\":\"EMERGENCY\",\"seq\":%lu}",
+                             (unsigned long long)(esp_timer_get_time() / 1000ULL),
+                             gpio_level,
+                             (unsigned long)s_tick);
+                    storage_append(record);
+                }
+
+                char info[21];
+                snprintf(info, sizeof(info), "STORE: %05lu PEND  ",
+                         (unsigned long)storage_get_pending_count());
+                oled_print(0, 3, info);
+
+                s_backoff_elapsed += 50U;
+                if (s_backoff_elapsed >= s_backoff_ms) {
+                    s_backoff_elapsed = 0U;
+                    uint32_t next_backoff_ms = s_backoff_ms * 2U;
+                    s_backoff_ms = (next_backoff_ms < 60000U) ? next_backoff_ms : 60000U;
+                    char backoff_str[21];
+                    snprintf(backoff_str, sizeof(backoff_str),
+                             "RETRY: %5lus       ",
+                             (unsigned long)(s_backoff_ms / 1000U));
+                    oled_print(0, 4, backoff_str);
+                    ESP_LOGI(TAG, "[EMERGENCY] Reconnect. Next: %lu ms",
+                             (unsigned long)s_backoff_ms);
+                    wifi_manager_reconnect();
+                }
+
+                EventBits_t bits = xEventGroupGetBits(g_wifi_event_group);
+                if (bits & WIFI_EVT_CONNECTED) {
+                    xEventGroupClearBits(g_wifi_event_group, WIFI_EVT_CONNECTED);
+                    s_backoff_ms      = 1000U;
+                    s_backoff_elapsed = 0U;
+                    ESP_LOGI(TAG, "Wi-Fi reconnected — %lu record(s) pending for DEV6",
+                             (unsigned long)storage_get_pending_count());
+                    current_mode = SYS_MODE_OPERATION;
+                    oled_print(0, 2, "FSM: OPERATION      ");
+                    last_state = -1; 
+                }
                 break;
+            }
 
             case SYS_MODE_RESYNC:
+                // Reserved for DEV6 — currently unreachable (see EMERGENCY above).
                 oled_print(0, 2, "FSM: RESYNC         ");
+                if (storage_get_pending_count() == 0U) {
+                    current_mode = SYS_MODE_OPERATION;
+                }
                 break;
-                
+
             default:
                 ESP_LOGE(TAG, "FSM: INVALID STATE %d — forcing EMERGENCY", current_mode);
                 current_mode = SYS_MODE_EMERGENCY;
                 break;
         }
 
-        s_tick++; // [DEV1] Advance FSM tick counter
-        // Deterministic sampling interval (50ms)
-        vTaskDelay(pdMS_TO_TICKS(50));
+        s_tick++; 
+        
+        // Absolute delay: guarantees the loop takes exactly 50ms, 
+        // accounting for the execution time of the code itself
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }

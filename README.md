@@ -34,14 +34,20 @@ a strict **Asymmetric Multiprocessing (AMP)** model:
 
 ## Operational States (FSM)
 
-The firmware transitions seamlessly between four states based on connectivity
-and storage events:
+The firmware transitions seamlessly between five states based on connectivity
+and storage events. The FSM operates on a strict, non-blocking 50ms deterministic
+tick (`vTaskDelayUntil`), utilizing 64-bit hardware timers to prevent uptime overflow crashes.
 
 ### `SYS_MODE_CONFIG` — First Boot / Provisioning
 Active when no Wi-Fi credentials exist in NVS. Core 1 starts a SoftAP
 (`resilient-iot-cfg`) and serves an HTTP Captive Portal at `192.168.4.1`.
 The field technician connects, submits SSID + password, and the device
-switches to STA mode and transitions to OPERATION automatically.
+transitions to CONNECTING.
+
+### `SYS_MODE_CONNECTING` — Transient Non-Blocking State
+A transient state that attempts Wi-Fi connection without blocking the main
+FreeRTOS loop. Allows Core 0 to continue reading sensors and updating the display
+while the Wi-Fi stack negotiates an IP address. Includes a 15-second timeout.
 
 ### `SYS_MODE_OPERATION` — Normal Online State
 Core 0 samples inputs deterministically at 50ms intervals. Core 1 streams
@@ -67,11 +73,11 @@ real-time acquisition with zero jitter throughout.
 |-------|-----------|
 | Microcontroller | Heltec WiFi LoRa 32 V3 (ESP32-S3FN8, Dual-Core Xtensa LX7 @ 240MHz) |
 | Framework | C / ESP-IDF 6.x (native, no Arduino abstraction) |
-| RTOS | FreeRTOS — 1000Hz tick, 8KB main task stack |
+| RTOS | FreeRTOS — drift-free 1000Hz tick, absolute timing tracking |
 | Storage | LittleFS (`joltwallet/littlefs` v1.21.1) — power-loss safe CoW journaling |
 | Connectivity | Wi-Fi 802.11 b/g/n + MQTT (QoS 1) |
 | Provisioning | Captive Portal — SoftAP + HTTP server + NVS credential storage |
-| Display | SSD1306 OLED — bare-metal I2C driver (no external library) |
+| Display | SSD1306 OLED — bare-metal I2C driver (isolated component) |
 
 ---
 
@@ -97,11 +103,9 @@ This constraint is enforced at the pin mapping level and documented in
 
 ### Serial Console
 
-This firmware uses **UART0** (GPIO 43/44) as the serial console — the default
-ESP-IDF configuration for the Heltec V3 board. Do not set
+This firmware uses **UART0** (GPIO 43/44) as the serial console. Do not set
 `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` on this hardware; the board uses a
-USB-UART bridge chip and the native USB peripheral is not connected to the
-USB port.
+USB-UART bridge chip and the native USB peripheral is not connected to the port.
 
 ---
 
@@ -111,37 +115,44 @@ USB port.
 resilient-iot-edge/
 ├── docs/
 │   ├── architecture/
-│   │   └── system_design.md      # AMP, FSM, Write-First, hardware constraints
+│   │   └── system_design.md    # AMP, FSM, Write-First, hardware constraints
 │   └── tests/
-│       └── validation_plan.md    # SVVP — TC-01 to TC-23 (IEEE Std 830-1998)
+│       └── validation_plan.md  # SVVP — TC-01 to TC-23 (IEEE Std 830-1998)
 ├── main/
-│   ├── main.c                    # FSM loop, OLED driver, hardware init
-│   ├── storage_driver.c          # LittleFS Write-First FIFO queue
-│   ├── storage_driver.h          # Storage API and constants
-│   ├── CMakeLists.txt            # Component build config
-│   └── idf_component.yml         # IDF Component Manager manifest
-├── partitions.csv                # Flash layout: 2MB factory + 2MB LittleFS
-├── sdkconfig.defaults            # RTOS, flash, stack, watchdog config
-├── dependencies.lock             # Pinned component versions
-└── CMakeLists.txt                # Root project config
+│   ├── main.c                  # FSM loop, hardware init
+│   ├── oled_driver.c/.h        # Isolated OLED bare-metal driver 
+│   ├── storage_driver.c/.h     # LittleFS Write-First FIFO queue
+│   ├── wifi_manager.c/.h       # Wi-Fi AP/STA management
+│   ├── captive_portal.c/.h     # HTTP + DNS provisioning portal
+│   ├── Kconfig.projbuild       # idf.py menuconfig integration
+│   ├── CMakeLists.txt          # Component build config
+│   └── idf_component.yml       # IDF Component Manager manifest
+├── partitions.csv              # Flash layout: 2MB factory + 2MB LittleFS
+├── sdkconfig.defaults          # RTOS, flash, stack, watchdog config
+├── dependencies.lock           # Pinned component versions
+└── CMakeLists.txt              # Root project config
 ```
 
 ---
 
 ## Development Status
 
-- [x] **Phase 1 — Setup & Planning:** Repository structure, architecture definition,
-      SVVP test plan, IEEE 830-1998 documentation baseline.
-- [x] **Phase 2 — Hardware & RTOS Base:** Heltec V3 pinout validation, OLED bare-metal
-      driver, FSM skeleton at 50ms deterministic tick.
-- [x] **Phase 3 — Local Storage:** LittleFS driver, Write-First policy, FIFO queue,
-      power-loss recovery validated (TC-05, TC-07, TC-08 partial).
-- [ ] **Phase 4 — Connectivity:** Wi-Fi STA/AP, Captive Portal provisioning,
-      MQTT client with QoS 1 and Will message.
-- [ ] **Phase 5 — Synchronization:** FSM complete 4-state transitions,
-      Store-and-Forward drain with PUBACK confirmation.
-- [ ] **Phase 6 — Final Validation:** BDD fault-injection tests, 72h stability
-      run, TC completion (TC-09 to TC-23).
+- [x] Phase 1 — Setup & Planning: Repository structure, architecture definition,
+SVVP test plan, IEEE 830-1998 documentation baseline.
+
+- [x] Phase 2 — Hardware & RTOS Base: Heltec V3 pinout validation, isolated OLED bare-metal
+driver, non-blocking FSM at 50ms deterministic tick with 64-bit overflow protection.
+
+- [x] Phase 3 — Local Storage: LittleFS driver, Write-First policy, FIFO queue,
+power-loss recovery validated. menuconfig integration for buffer sizing.
+
+- [ ] Phase 4 — Connectivity: Wi-Fi STA/AP and Captive Portal implemented. [WIP] MQTT client with QoS 1 and Will message pending.
+
+- [ ] Phase 5 — Synchronization: FSM complete 5-state transitions,
+Store-and-Forward drain with PUBACK confirmation.
+
+- [ ] Phase 6 — Final Validation: BDD fault-injection tests, 72h stability
+run, TC completion (TC-09 to TC-23).
 
 ---
 
@@ -157,18 +168,19 @@ resilient-iot-edge/
 ### Build and Flash
 
 ```bash
-# First build — downloads joltwallet/littlefs automatically
-idf.py build
+# Set configuration options (e.g. Emergency minimum buffer duration)
+idf.py menuconfig
 
-# Flash and monitor (adjust port as needed)
+# Build and flash (adjust port as needed)
+idf.py build
 idf.py -p COM7 flash monitor
 ```
 
 ### First Boot
 
 On first boot with an empty NVS, the device enters CONFIG state and creates
-a Wi-Fi access point named `resilient-iot-cfg`. Connect a phone or laptop
-to that network and navigate to `192.168.4.1` to provision Wi-Fi credentials.
+a Wi-Fi access point named resilient-iot-cfg. Connect a phone or laptop
+to that network and navigate to 192.168.4.1 to provision Wi-Fi credentials.
 
 ### Expected Serial Output (after provisioning)
 
@@ -176,9 +188,11 @@ to that network and navigate to `192.168.4.1` to provision Wi-Fi credentials.
 I (xxx) SYSTEM_MAIN: Configuring basic hardware interface...
 I (xxx) SYSTEM_MAIN: Initializing OLED display...
 I (xxx) SYSTEM_MAIN: Initializing LittleFS Storage...
-I (xxx) STORAGE: LittleFS: 2048 KB total | 4 KB used | 2044 KB free
-I (xxx) SYSTEM_MAIN: Storage ready. Pending records: 0
-I (xxx) SYSTEM_MAIN: [DEV1] Record stored. Pending: 1
+I (xxx) SYSTEM_MAIN: Initializing Wi-Fi manager...
+I (xxx) SYSTEM_MAIN: NVS credentials found — connecting to 'My-WiFi'
+I (xxx) SYSTEM_MAIN: [RECOVERY] 14 record(s) pending from previous session
+I (xxx) SYSTEM_MAIN: Wi-Fi connected — entering OPERATION
+I (xxx) SYSTEM_MAIN: [OPERATION] GPIO 4: LOW -> GPIO 2: LOW
 ```
 
 ---
