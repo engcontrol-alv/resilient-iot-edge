@@ -117,7 +117,7 @@ resilient-iot-edge/
 │   ├── architecture/
 │   │   └── system_design.md    # AMP, FSM, Write-First, hardware constraints
 │   └── tests/
-│       └── validation_plan.md  # SVVP — TC-01 to TC-23 (IEEE Std 830-1998)
+│       └── validation_plan.md  # SVVP — TC-01 to TC-23
 ├── main/
 │   ├── main.c                  # FSM loop, hardware init
 │   ├── oled_driver.c/.h        # Isolated OLED bare-metal driver 
@@ -202,7 +202,8 @@ I (xxx) SYSTEM_MAIN: [OPERATION] GPIO 4: LOW -> GPIO 2: LOW
 | Document | Description |
 |----------|-------------|
 | [`docs/architecture/system_design.md`](docs/architecture/system_design.md) | Full architecture: AMP, FSM states, Write-First policy, thread safety, hardware constraints |
-| [`docs/tests/validation_plan.md`](docs/tests/validation_plan.md) | SVVP: 23 test cases mapped to implementation phases (IEEE Std 830-1998) |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADRs) tracking core design choices |
+| [`docs/tests/validation_plan.md`](docs/tests/validation_plan.md) | SVVP: 23 test cases mapped to implementation phases |
 
 ---
 
