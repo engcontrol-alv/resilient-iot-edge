@@ -8,6 +8,7 @@ idf_component_register(
         "wifi_manager.c"         # [DEV2] Wi-Fi AP/STA + NVS credentials
         "captive_portal.c"       # [DEV2] HTTP server + DNS responder
         "oled_driver.c"
+        "mqtt_manager.c"         # [DEV4] Cliente MQTT
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -21,4 +22,5 @@ idf_component_register(
         esp_event
         esp_http_server
         lwip
+        mqtt                 
 )

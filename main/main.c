@@ -12,6 +12,8 @@
 #include "wifi_manager.h"        // [DEV2] Wi-Fi AP/STA management
 #include "captive_portal.h"      // [DEV2] HTTP + DNS provisioning portal
 #include "oled_driver.h"         // [REFACTORED] OLED Display Driver
+#include "mqtt_manager.h"
+
 
 // --- I/O MAPPING ---
 #define TEST_GPIO_A 4        // INPUT (Controller Signal)
@@ -156,6 +158,10 @@ void app_main(void)
                     oled_print(0, 2, "FSM: OPERATION      ");
                     oled_print(0, 4, "                    ");
                     ESP_LOGI(TAG, "Wi-Fi connected — entering OPERATION");
+                    
+                    // INICIALIZA O MQTT APÓS O WI-FI CONECTAR PELA PRIMEIRA VEZ
+                    ESP_LOGI(TAG, "Inicializando Cliente MQTT...");
+                    mqtt_manager_init();
                 } 
                 // 15-second timeout (15,000,000 microseconds)
                 else if ((bits & WIFI_EVT_DISCONNECTED) || 
